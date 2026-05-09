@@ -1,0 +1,16 @@
+python-dotenv==1.0.1
+pydantic==2.7.1
+pydantic-settings==2.3.1
+
+# LangChain 核心及官方生态 (注意最新的包名变化)
+langchain==0.2.1
+langchain-openai==0.1.8
+langchain-community==0.2.1
+langchain-chroma==0.1.1
+
+# 文档解析
+pypdf==4.2.0
+
+# Web框架 (阶段二使用)
+fastapi==0.111.0
+uvicorn==0.29.0
