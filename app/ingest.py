@@ -1,59 +1,97 @@
 import os
-from langchain_community.document_loaders import TextLoader
+from typing import List
+from langchain_community.document_loaders import TextLoader, PyPDFLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
 from app.config import settings
-from app.config import settings, PROJECT_ROOT
+
+# 支持的文件扩展名与对应的 Loader 映射
+LOADERS = {
+    ".txt": TextLoader,
+    ".pdf": PyPDFLoader,
+    ".docx": Docx2txtLoader
+}
 
 
+def load_documents(source_dir: str) -> List:
+    """读取源目录下的所有支持格式的文档"""
+    documents = []
+    for filename in os.listdir(source_dir):
+        file_ext = os.path.splitext(filename)[1].lower()  # 获取后缀名并转小写
 
-def ingest_data(file_path: str):
-    """读取文档、分块、向量化并存入本地数据库"""
-    print(f"-> 开始加载文档: {file_path}")
+        if file_ext in LOADERS:
+            file_path = os.path.join(source_dir, filename)
+            print(f"📄 正在解析文件: {filename}")
 
-    # 1. 加载文档
-    loader = TextLoader(file_path, encoding='utf-8')
-    docs = loader.load()
+            try:
+                loader_class = LOADERS[file_ext]
+                # 如果是 TXT 文件，强制使用 UTF-8 编码，防止 Windows 下中文乱码
+                if file_ext == ".txt":
+                    loader = loader_class(file_path, encoding="utf-8")
+                else:
+                    loader = loader_class(file_path)
 
-    # 2. 切分文档 (chunk_size调小，让每个知识块更精准)
+                docs = loader.load()
+
+                # 给每个文档的元数据加上文件名，方便后续溯源
+                for doc in docs:
+                    doc.metadata["source"] = filename
+                    # 移除 PDF 的 page 等元数据噪声，避免干扰向量检索
+                    doc.metadata.pop("page", None)
+                    # print(f"   内容预览: {doc.page_content[:100]}")  # 临时加这行看看
+
+                documents.extend(docs)
+            except Exception as e:
+                print(f"⚠️ 解析文件 {filename} 失败: {e}")
+
+    return documents
+
+
+def main():
+    print("🚀 开始构建星际科技私有知识库...")
+
+    source_dir = os.path.join(settings.BASE_DIR, "data", "raw_docs")
+
+    if not os.path.exists(source_dir):
+        print(f"❌ 找不到原始文档目录: {source_dir}")
+        return
+
+    # 1. 加载多格式文档
+    documents = load_documents(source_dir)
+    if not documents:
+        print("❌ 未找到任何可解析的文档！")
+        return
+
+    print(f"✅ 文档读取完成，共加载 {len(documents)} 个页段。")
+
+    # 2. 切分文档
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=100,  # 从200改为100
-        chunk_overlap=20,  # 从50改为20
+        chunk_size=500,
+        chunk_overlap=100,
         length_function=len,
-        separators=["\n\n", "\n", "。", "，", " "]  # 新增：优先按空行切分
+        separators=["\n\n", "\n", "。", "，", " "]
     )
+    split_docs = text_splitter.split_documents(documents)
+    print(f"✂️ 文档切分完成，共生成 {len(split_docs)} 个知识块。")
 
-    splits = text_splitter.split_documents(docs)
-    print(f"-> 文档切分完成，共生成 {len(splits)} 个知识块。")
-
-    # 3. 初始化本地 Embedding 模型 (完全离线，保护隐私)
-    # 首次运行会自动从HuggingFace下载模型，需稍等片刻
-    print("-> 正在加载本地Embedding模型 (首次运行需下载)...")
+    # 3. 初始化 Embedding 模型
+    print("⏳ 正在加载本地 Embedding 模型 (首次运行需下载，请稍候)...")
     embeddings = HuggingFaceEmbeddings(
         model_name="shibing624/text2vec-base-chinese",
-        model_kwargs={'device': 'cpu'}  # 确保在没有GPU的机器上也能跑
+        model_kwargs={'device': 'cpu'}
     )
 
-    # 4. 存入 Chroma 向量数据库
-    print("-> 正在进行向量化并持久化存储...")
-    vectorstore = Chroma.from_documents(
-        documents=splits,
+    # 4. 向量化并存入 ChromaDB
+    print("⏳ 正在计算向量并构建数据库（耗时较长，请耐心等待）...")
+    db = Chroma.from_documents(
+        documents=split_docs,
         embedding=embeddings,
         persist_directory=settings.VECTOR_DB_PATH
     )
-    print(f"✅ 知识库构建完成！保存路径: {settings.VECTOR_DB_PATH}")
+
+    print(f"✅ 知识库构建完成！共存储 {db._collection.count()} 条向量数据。")
 
 
 if __name__ == "__main__":
-    # 使用配置中的路径，而不是硬编码相对路径
-    import os
-    from app.config import settings
-
-    data_dir = os.path.join(str(PROJECT_ROOT), "data")
-    data_file = os.path.join(data_dir, "company_knowledge.txt")
-
-    if os.path.exists(data_file):
-        ingest_data(data_file)
-    else:
-        print(f"❌ 找不到数据文件: {data_file}")
+    main()

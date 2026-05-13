@@ -7,6 +7,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
+    # 新增：计算项目根目录的绝对路径（通过 config.py 所在目录的上一级来定位）
+    BASE_DIR: str = str(Path(__file__).resolve().parent.parent)
+
     """全局配置类，自动读取 .env 文件"""
     # DeepSeek 配置
     DEEPSEEK_API_KEY: str
