@@ -1,97 +1,177 @@
+"""
+Enterprise-RAG-System V2.0 - 知识库构建模块
+基于 LangChain + ChromaDB 的文档处理与向量存储
+"""
+
 import os
-from typing import List
-from langchain_community.document_loaders import TextLoader, PyPDFLoader, Docx2txtLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from app.config import settings
+import sys
+import uuid
+from typing import List, Dict, Any
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    Docx2txtLoader,
+    TextLoader,
+    UnstructuredFileLoader
+)
+from langchain_core.documents import Document
+from langchain_chroma import Chroma
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
+from langchain_community.llms import Ollama
+from langchain.chains import LLMChain
 
-# 支持的文件扩展名与对应的 Loader 映射
-LOADERS = {
-    ".txt": TextLoader,
-    ".pdf": PyPDFLoader,
-    ".docx": Docx2txtLoader
-}
+# 添加项目根目录到 Python 路径
+# sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 正确的导入方式
+from chromadb import PersistentClient
 
-def load_documents(source_dir: str) -> List:
-    """读取源目录下的所有支持格式的文档"""
-    documents = []
-    for filename in os.listdir(source_dir):
-        file_ext = os.path.splitext(filename)[1].lower()  # 获取后缀名并转小写
+# 或者
+import chromadb
+db = chromadb.PersistentClient(path="data/chroma_db")
 
-        if file_ext in LOADERS:
-            file_path = os.path.join(source_dir, filename)
-            print(f"📄 正在解析文件: {filename}")
-
-            try:
-                loader_class = LOADERS[file_ext]
-                # 如果是 TXT 文件，强制使用 UTF-8 编码，防止 Windows 下中文乱码
-                if file_ext == ".txt":
-                    loader = loader_class(file_path, encoding="utf-8")
-                else:
-                    loader = loader_class(file_path)
-
-                docs = loader.load()
-
-                # 给每个文档的元数据加上文件名，方便后续溯源
-                for doc in docs:
-                    doc.metadata["source"] = filename
-                    # 移除 PDF 的 page 等元数据噪声，避免干扰向量检索
-                    doc.metadata.pop("page", None)
-                    # print(f"   内容预览: {doc.page_content[:100]}")  # 临时加这行看看
-
-                documents.extend(docs)
-            except Exception as e:
-                print(f"⚠️ 解析文件 {filename} 失败: {e}")
-
-    return documents
+# 配置常量
+CHROMA_DB_PATH = "data/chroma_db"
+COLLECTION_NAME = "enterprise_knowledge"
+LLM_MODEL = "qwen2.5:3b"
+EMBEDDING_MODEL = "nomic-embed-text"
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
 
 
-def main():
-    print("🚀 开始构建星际科技私有知识库...")
+def load_document(file_path: str) -> List[Document]:
+    """根据文件类型加载文档"""
+    ext = os.path.splitext(file_path)[1].lower()
 
-    source_dir = os.path.join(settings.BASE_DIR, "data", "raw_docs")
+    try:
+        if ext == ".pdf":
+            loader = PyPDFLoader(file_path)  # 用 PDF 阅读器
+        elif ext in [".docx", ".doc"]:
+            loader = Docx2txtLoader(file_path)  # 用 Word 阅读器
+        elif ext == ".txt":
+            loader = TextLoader(file_path, encoding="utf-8")   # 用记事本
+        else:
+            loader = UnstructuredFileLoader(file_path)   # 万能备用
 
-    if not os.path.exists(source_dir):
-        print(f"❌ 找不到原始文档目录: {source_dir}")
-        return
+        return loader.load()    # 读取内容，返回 Document 对象列表
+    except Exception as e:
+        print(f"❌ 加载文件 {file_path} 失败: {str(e)}")
+        return []    # 失败返回空列表，不中断程序
 
-    # 1. 加载多格式文档
-    documents = load_documents(source_dir)
-    if not documents:
-        print("❌ 未找到任何可解析的文档！")
-        return
 
-    print(f"✅ 文档读取完成，共加载 {len(documents)} 个页段。")
-
-    # 2. 切分文档
+def split_documents(documents: List[Document]) -> List[Document]:
+    """分割文档为文本块"""
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=100,
-        length_function=len,
-        separators=["\n\n", "\n", "。", "，", " "]
+        chunk_size=CHUNK_SIZE,   # 1000 字符
+        chunk_overlap=CHUNK_OVERLAP,   # 200 字符重叠
+        length_function=len,     # 用 len() 计算长度
+        is_separator_regex=False,    # 不用正则表达式分隔
     )
-    split_docs = text_splitter.split_documents(documents)
-    print(f"✂️ 文档切分完成，共生成 {len(split_docs)} 个知识块。")
+    return text_splitter.split_documents(documents)
 
-    # 3. 初始化 Embedding 模型
-    print("⏳ 正在加载本地 Embedding 模型 (首次运行需下载，请稍候)...")
-    embeddings = HuggingFaceEmbeddings(
-        model_name="shibing624/text2vec-base-chinese",
-        model_kwargs={'device': 'cpu'}
+
+def get_embedding_function():
+    """获取嵌入模型"""
+    return OllamaEmbeddings(model=EMBEDDING_MODEL)
+
+
+def add_to_chroma(chunks: List[Document]):
+    """将文档块添加到 ChromaDB"""
+    # 初始化 ChromaDB 客户端
+    db = Chroma(
+        persist_directory=CHROMA_DB_PATH,
+        embedding_function=get_embedding_function(),
+        collection_name=COLLECTION_NAME
     )
 
-    # 4. 向量化并存入 ChromaDB
-    print("⏳ 正在计算向量并构建数据库（耗时较长，请耐心等待）...")
-    db = Chroma.from_documents(
-        documents=split_docs,
-        embedding=embeddings,
-        persist_directory=settings.VECTOR_DB_PATH
-    )
+    # 获取现有文档的来源（去重）
+    existing_sources = set()
+    existing_items = db.get(include=["metadatas"])
+    if existing_items and "metadatas" in existing_items:
+        for meta in existing_items["metadatas"]:
+            if "source" in meta:
+                existing_sources.add(meta["source"])
 
-    print(f"✅ 知识库构建完成！共存储 {db._collection.count()} 条向量数据。")
+    # 过滤掉已存在的文档
+    new_chunks = []
+    skipped_count = 0
+
+    for chunk in chunks:
+        source = chunk.metadata.get('source', '')
+
+        # 如果该来源已存在，跳过
+        if source in existing_sources:
+            skipped_count += 1
+            continue
+
+        new_chunks.append(chunk)
+        # 标记为已处理（避免同一批次重复）
+        existing_sources.add(source)
+
+    if skipped_count > 0:
+        print(f"⚠️ 跳过 {skipped_count} 个已存在的文档块")
+
+    if new_chunks:
+        print(f"🆕 发现 {len(new_chunks)} 个新文档块")
+
+        # 生成唯一ID
+        new_chunk_ids = []
+        for chunk in new_chunks:
+            source = chunk.metadata.get('source', 'unknown')
+            page = chunk.metadata.get('page', 'unknown')
+            chunk_id = f"{source}_{page}_{uuid.uuid4()}"
+            new_chunk_ids.append(chunk_id)
+
+        # 添加新文档块
+        db.add_documents(new_chunks, ids=new_chunk_ids)
+        print("✅ 新文档块已添加到知识库")
+        return "new_chunks_added"
+    else:
+        print("ℹ️ 没有新文档块需要添加（所有文档已存在）")
+        return "no_new_chunks"
+
+def ingest_documents(file_paths: List[str]):
+    """处理文档并构建知识库"""
+    print(f"📄 开始处理 {len(file_paths)} 个文档...")
+
+    # 加载文档
+    documents = []
+    for file_path in file_paths:
+        print(f"📖 加载文档: {file_path}")
+        docs = load_document(file_path)
+        if docs:
+            documents.extend(docs)
+        else:
+            print(f"⚠️ 文档 {file_path} 加载失败或为空")
+
+    if not documents:
+        print("❌ 没有加载到任何文档")
+        return "no_documents_loaded"
+
+    # 分割文档
+    chunks = split_documents(documents)
+    print(f"📝 分割为 {len(chunks)} 个文本块")
+
+    # 添加到 ChromaDB
+    result = add_to_chroma(chunks)
+
+    print("✅ 知识库构建完成！")
+    return result
 
 
-if __name__ == "__main__":
-    main()
+def process_documents(file_paths: List[str]):
+    """处理上传的文档并构建知识库"""
+    print(f"开始处理 {len(file_paths)} 个文档...")
+
+    # 复用原有的 ingest 逻辑
+    result = ingest_documents(file_paths)
+
+    print("文档处理完成！")
+    return result
+
+
+# 导出必要的函数
+# ingest_documents = ingest_documents
+# process_documents = process_documents
