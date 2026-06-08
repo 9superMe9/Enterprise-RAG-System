@@ -1,0 +1,95 @@
+// ==========================================
+// Enterprise RAG System - Global Styles
+// 浅色主题
+// ==========================================
+
+// 主题色变量
+$primary-color: #1677ff;
+$success-color: #52c41a;
+$warning-color: #faad14;
+$danger-color: #ff4d4f;
+$bg-color: #f0f2f5;
+$sidebar-bg: #ffffff;
+$main-bg: #f5f6f8;
+$card-bg: #ffffff;
+$border-color: #e8e8e8;
+$text-primary: #1f1f1f;
+$text-secondary: #8c8c8c;
+$text-muted: #bfbfbf;
+$radius: 12px;
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: $bg-color;
+  color: $text-primary;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+// 滚动条美化
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #d9d9d9;
+  border-radius: 3px;
+  &:hover {
+    background: #bfbfbf;
+  }
+}
+
+// Element Plus 覆盖
+.el-message {
+  z-index: 9999 !important;
+}
+
+// 布局工具类
+.flex-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.flex-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.text-ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+// 消息 markdown 渲染
+.message-content {
+  line-height: 1.7;
+  word-break: break-word;
+
+  p { margin: 0 0 8px; &:last-child { margin: 0; } }
+  code {
+    background: #f5f5f5;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.9em;
+  }
+  pre {
+    background: #f5f5f5;
+    padding: 12px;
+    border-radius: 8px;
+    overflow-x: auto;
+    code { background: none; padding: 0; }
+  }
+  ul, ol { padding-left: 20px; margin: 4px 0; }
+}

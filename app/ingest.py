@@ -1,177 +1,161 @@
-"""
+﻿"""
 Enterprise-RAG-System V2.0 - 知识库构建模块
-基于 LangChain + ChromaDB 的文档处理与向量存储
+基于 LangChain + ChromaDB 的统一文档处理与向量存储
 """
 
 import os
-import sys
 import uuid
-from typing import List, Dict, Any
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from typing import List
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
-    PyPDFLoader,
-    Docx2txtLoader,
-    TextLoader,
-    UnstructuredFileLoader
+    PyPDFLoader, Docx2txtLoader, TextLoader, UnstructuredFileLoader
 )
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
-from langchain_chroma import Chroma
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain.prompts import PromptTemplate
-from langchain.chains import RetrievalQA
-from langchain_community.llms import Ollama
-from langchain.chains import LLMChain
+from app.config import settings
+from app.logger import logger
 
-# 添加项目根目录到 Python 路径
-# sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 正确的导入方式
-from chromadb import PersistentClient
-
-# 或者
-import chromadb
-db = chromadb.PersistentClient(path="data/chroma_db")
-
-# 配置常量
-CHROMA_DB_PATH = "data/chroma_db"
+# ---- 配置常量 ----
 COLLECTION_NAME = "enterprise_knowledge"
-LLM_MODEL = "qwen2.5:3b"
-EMBEDDING_MODEL = "nomic-embed-text"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
+EMBEDDING_MODEL_NAME = "shibing624/text2vec-base-chinese"
 
 
 def load_document(file_path: str) -> List[Document]:
-    """根据文件类型加载文档"""
+    """根据文件扩展名加载文档，支持 PDF/Word/TXT/通用格式。"""
     ext = os.path.splitext(file_path)[1].lower()
 
     try:
         if ext == ".pdf":
-            loader = PyPDFLoader(file_path)  # 用 PDF 阅读器
+            loader = PyPDFLoader(file_path)
         elif ext in [".docx", ".doc"]:
-            loader = Docx2txtLoader(file_path)  # 用 Word 阅读器
+            loader = Docx2txtLoader(file_path)
         elif ext == ".txt":
-            loader = TextLoader(file_path, encoding="utf-8")   # 用记事本
+            loader = TextLoader(file_path, encoding="utf-8")
         else:
-            loader = UnstructuredFileLoader(file_path)   # 万能备用
+            loader = UnstructuredFileLoader(file_path)
 
-        return loader.load()    # 读取内容，返回 Document 对象列表
+        return loader.load()
     except Exception as e:
-        print(f"❌ 加载文件 {file_path} 失败: {str(e)}")
-        return []    # 失败返回空列表，不中断程序
+        logger.error(f"加载文件失败: {file_path} | {str(e)}")
+        return []
 
 
 def split_documents(documents: List[Document]) -> List[Document]:
-    """分割文档为文本块"""
+    """将长文档分割为语义文本块（chunk）。"""
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,   # 1000 字符
-        chunk_overlap=CHUNK_OVERLAP,   # 200 字符重叠
-        length_function=len,     # 用 len() 计算长度
-        is_separator_regex=False,    # 不用正则表达式分隔
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        length_function=len,
+        is_separator_regex=False,
     )
     return text_splitter.split_documents(documents)
 
 
 def get_embedding_function():
-    """获取嵌入模型"""
-    return OllamaEmbeddings(model=EMBEDDING_MODEL)
-
-
-def add_to_chroma(chunks: List[Document]):
-    """将文档块添加到 ChromaDB"""
-    # 初始化 ChromaDB 客户端
-    db = Chroma(
-        persist_directory=CHROMA_DB_PATH,
-        embedding_function=get_embedding_function(),
-        collection_name=COLLECTION_NAME
+    """获取嵌入模型 —— 与 chain.py 使用相同的模型以保证向量空间一致。"""
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL_NAME,
+        model_kwargs={'device': 'cpu'}
     )
 
-    # 获取现有文档的来源（去重）
-    existing_sources = set()
+
+def _get_existing_filenames(db) -> set:
+    """从 ChromaDB 中收集已存在文档的文件名（basename），用于去重。"""
+    filenames = set()
     existing_items = db.get(include=["metadatas"])
     if existing_items and "metadatas" in existing_items:
         for meta in existing_items["metadatas"]:
             if "source" in meta:
-                existing_sources.add(meta["source"])
+                filenames.add(os.path.basename(meta["source"]))
+    return filenames
 
-    # 过滤掉已存在的文档
-    new_chunks = []
-    skipped_count = 0
 
+def _filter_new_chunks_by_filename(chunks: List[Document], existing_filenames: set):
+    """过滤出尚未入库的文件对应的 chunk，以文件名（basename）为去重单位。
+    同一文件的所有 chunk 要么全部加入，要么全部跳过。"""
+    filenames_to_skip = set()
+    # 第一遍：收集所有需要跳过的文件名
     for chunk in chunks:
-        source = chunk.metadata.get('source', '')
-
-        # 如果该来源已存在，跳过
-        if source in existing_sources:
-            skipped_count += 1
+        fname = os.path.basename(chunk.metadata.get('source', ''))
+        if fname in existing_filenames:
+            filenames_to_skip.add(fname)
+    # 第二遍：过滤 chunk
+    new_chunks = []
+    skipped = 0
+    for chunk in chunks:
+        fname = os.path.basename(chunk.metadata.get('source', ''))
+        if fname in filenames_to_skip:
+            skipped += 1
             continue
-
         new_chunks.append(chunk)
-        # 标记为已处理（避免同一批次重复）
-        existing_sources.add(source)
+    return new_chunks, skipped
 
-    if skipped_count > 0:
-        print(f"⚠️ 跳过 {skipped_count} 个已存在的文档块")
+
+def _generate_chunk_ids(chunks: List[Document]) -> List[str]:
+    """为每个文档块生成唯一ID。"""
+    return [
+        f"{chunk.metadata.get('source', 'unknown')}_{chunk.metadata.get('page', 'unknown')}_{uuid.uuid4()}"
+        for chunk in chunks
+    ]
+
+
+def add_to_chroma(chunks: List[Document]):
+    """将文档块写入 ChromaDB，自动跳过已存在的文档。"""
+    db = Chroma(
+        persist_directory=settings.VECTOR_DB_PATH,
+        embedding_function=get_embedding_function(),
+        collection_name=COLLECTION_NAME
+    )
+
+    existing_filenames = _get_existing_filenames(db)
+    new_chunks, skipped = _filter_new_chunks_by_filename(chunks, existing_filenames)
+
+    if skipped > 0:
+        logger.info(f"跳过 {skipped} 个已存在的文档块")
 
     if new_chunks:
-        print(f"🆕 发现 {len(new_chunks)} 个新文档块")
-
-        # 生成唯一ID
-        new_chunk_ids = []
-        for chunk in new_chunks:
-            source = chunk.metadata.get('source', 'unknown')
-            page = chunk.metadata.get('page', 'unknown')
-            chunk_id = f"{source}_{page}_{uuid.uuid4()}"
-            new_chunk_ids.append(chunk_id)
-
-        # 添加新文档块
+        logger.info(f"正在写入 {len(new_chunks)} 个新文档块...")
+        new_chunk_ids = _generate_chunk_ids(new_chunks)
         db.add_documents(new_chunks, ids=new_chunk_ids)
-        print("✅ 新文档块已添加到知识库")
+        logger.info(f"已写入 {len(new_chunks)} 个新文档块")
         return "new_chunks_added"
     else:
-        print("ℹ️ 没有新文档块需要添加（所有文档已存在）")
+        logger.info("没有新文档块需要添加（所有文件已存在）")
         return "no_new_chunks"
 
-def ingest_documents(file_paths: List[str]):
-    """处理文档并构建知识库"""
-    print(f"📄 开始处理 {len(file_paths)} 个文档...")
 
-    # 加载文档
+def ingest_documents(file_paths: List[str]):
+    """处理文档并构建知识库（统一入口）。"""
+    if not file_paths:
+        logger.warning("ingest_documents 收到空文件列表")
+        return "no_documents_loaded"
+
+    logger.info(f"开始处理 {len(file_paths)} 个文件...")
+
+    # 加载文档。
     documents = []
     for file_path in file_paths:
-        print(f"📖 加载文档: {file_path}")
+        abs_path = os.path.abspath(file_path)
+        logger.info(f"加载文件: {abs_path}")
         docs = load_document(file_path)
         if docs:
             documents.extend(docs)
         else:
-            print(f"⚠️ 文档 {file_path} 加载失败或为空")
+            logger.warning(f"文件加载失败或为空: {file_path}")
 
     if not documents:
-        print("❌ 没有加载到任何文档")
+        logger.error("没有加载到任何文档")
         return "no_documents_loaded"
 
-    # 分割文档
+    # 分割文档。
     chunks = split_documents(documents)
-    print(f"📝 分割为 {len(chunks)} 个文本块")
+    logger.info(f"分割为 {len(chunks)} 个文本块")
 
     # 添加到 ChromaDB
     result = add_to_chroma(chunks)
-
-    print("✅ 知识库构建完成！")
+    logger.info("知识库构建完成！")
     return result
-
-
-def process_documents(file_paths: List[str]):
-    """处理上传的文档并构建知识库"""
-    print(f"开始处理 {len(file_paths)} 个文档...")
-
-    # 复用原有的 ingest 逻辑
-    result = ingest_documents(file_paths)
-
-    print("文档处理完成！")
-    return result
-
-
-# 导出必要的函数
-# ingest_documents = ingest_documents
-# process_documents = process_documents

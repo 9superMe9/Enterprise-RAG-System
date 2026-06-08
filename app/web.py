@@ -1,287 +1,284 @@
 """
-Enterprise-RAG-System V2.0 - Web 界面
-基于 Streamlit 的企业级私有知识库问答系统 (独立运行版)
+Enterprise-RAG-System V2.1 - Web UI
+Dark tech theme with model routing, file management
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import os, shutil, tempfile
 import streamlit as st
-# Web 框架，用 Python 写网页
-import ollama
-# 本地大模型客户端（调用 Ollama 服务）
-from chromadb import PersistentClient
-# 直接操作 ChromaDB 数据库
-from langchain.prompts import PromptTemplate
-# 提示词模板工具
-from app.ingest import process_documents
-# 复用文档处理功能（上传文档时用）
+import chromadb
+from app.config import settings
+from app.chain import get_rag
+from app.ingest import ingest_documents
+from app.logger import logger
 
-# ==========================================
-# 1. 核心配置 (直接内嵌，避免跨目录导入)
-# ==========================================
-CHROMA_DB_PATH = "data/chroma_db"
-COLLECTION_NAME = "enterprise_knowledge"
-LLM_MODEL = "qwen2.5:3b"  # 本地大模型
-
-
-# ==========================================
-# 2. 核心功能函数 (直接内嵌)
-# ==========================================
-def retrieve_context(query, top_k=5):  # 增加检索数量
-    """从 ChromaDB 检索相关上下文"""
-    try:
-        client = PersistentClient(path=CHROMA_DB_PATH)
-        collection = client.get_collection(COLLECTION_NAME)
-
-        query_embedding = ollama.embeddings(model="nomic-embed-text", prompt=query)["embedding"]
-
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"]
-        )
-
-        context_results = []
-        if results and results['documents']:
-            for i in range(len(results['documents'][0])):
-                doc_content = results['documents'][0][i]
-                metadata = results['metadatas'][0][i]
-                distance = results['distances'][0][i]
-
-                from langchain_core.documents import Document
-                doc = Document(page_content=doc_content, metadata=metadata)
-                context_results.append((doc, distance))
-
-        print(f"🔍 检索到 {len(context_results)} 条相关文档")
-        for doc, dist in context_results:
-            print(f"  - 内容预览: {doc.page_content[:100]}... (距离: {dist:.4f})")
-
-        return context_results
-    except Exception as e:
-        print(f"❌ 检索失败: {str(e)}")
-        return []
-
-def generate_answer(query, context):
-    """调用本地大模型生成回答"""
-    if not context or len(context.strip()) == 0:
-        return "根据现有知识库无法回答该问题"
-
-    prompt_template = PromptTemplate(
-        template="""你是企业级智能助手。请严格基于以下【参考内容】回答用户问题。
-如果【参考内容】中没有相关信息，请直接回答"根据现有知识库无法回答该问题"，不要自行编造。
-
-【参考内容】：
-{context}
-
-用户问题：{query}
-
-专业解答：""",
-        input_variables=["context", "query"]
-    )
-
-    prompt = prompt_template.format(context=context, query=query)
-
-    print(f"📤 发送给模型的 Prompt 长度: {len(prompt)} 字符")
-    print(f"📤 Prompt 预览: {prompt[:500]}...")
-
-    try:
-        response = ollama.chat(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        answer = response["message"]["content"]
-        print(f"📥 模型回答: {answer[:200]}...")
-        return answer
-    except Exception as e:
-        print(f"❌ 调用模型失败: {str(e)}")
-        return f"调用模型失败: {str(e)}"
-
-
-# ==========================================
-# 页面基础配置
-# ==========================================
+# ---- Page Config ----
 st.set_page_config(
-    page_title="星际科技 · 企业知识库",  # 浏览器标签标题
-    page_icon="🤖",   # 标签图标
-    layout="wide",   # 宽屏布局
+    page_title="StarTech | Enterprise RAG",
+    page_icon="🔮",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ==========================================
-# 侧边栏 - 知识库状态 & 系统配置
-# ==========================================
-with st.sidebar:
-    st.title("⚙️ 系统状态")
+# ---- Custom CSS ----
+st.markdown("""<style>
+.stApp { background: linear-gradient(135deg, #0a0a1a 0%, #0d1117 50%, #0a0a1a 100%); }
+.main .block-container { padding-top: 1.5rem; }
+[data-testid="stSidebar"] { background: linear-gradient(180deg, rgba(10,15,30,0.98) 0%, rgba(13,17,23,0.99) 100%); border-right: 1px solid rgba(0,212,255,0.12); }
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 { color: #00d4ff !important; font-weight: 600; }
+.stMetric { background: rgba(0,212,255,0.04) !important; border: 1px solid rgba(0,212,255,0.12) !important; border-radius: 12px !important; padding: 12px 16px !important; }
+.stMetric:hover { border-color: rgba(0,212,255,0.35) !important; box-shadow: 0 0 20px rgba(0,212,255,0.08); }
+.stMetric label { color: #607B9E !important; font-size: 0.7rem; letter-spacing: 1px; text-transform: uppercase; }
+.stMetric [data-testid="stMetricValue"] { color: #E6F1FF !important; font-size: 1.6rem; font-weight: 700; }
+.stButton > button { background: linear-gradient(135deg, rgba(0,212,255,0.12), rgba(123,47,255,0.12)) !important; border: 1px solid rgba(0,212,255,0.25) !important; border-radius: 8px !important; color: #00d4ff !important; font-weight: 600 !important; transition: all 0.3s !important; }
+.stButton > button:hover { background: linear-gradient(135deg, rgba(0,212,255,0.22), rgba(123,47,255,0.22)) !important; border-color: rgba(0,212,255,0.5) !important; box-shadow: 0 0 25px rgba(0,212,255,0.15) !important; }
+[data-testid="stChatMessage"] { background: rgba(13,17,23,0.85) !important; border: 1px solid rgba(0,212,255,0.07) !important; border-radius: 14px !important; padding: 18px 22px !important; margin: 6px 0 !important; }
+[data-testid="stChatInput"] textarea { background: rgba(13,17,23,0.95) !important; border: 1px solid rgba(0,212,255,0.2) !important; border-radius: 14px !important; color: #E6F1FF !important; }
+[data-testid="stChatInput"] textarea:focus { border-color: rgba(0,212,255,0.5) !important; box-shadow: 0 0 30px rgba(0,212,255,0.08) !important; }
+[data-testid="stFileUploader"] { background: rgba(0,212,255,0.02) !important; border: 1px dashed rgba(0,212,255,0.2) !important; border-radius: 12px !important; padding: 12px !important; }
+div[data-baseweb="select"] > div { background: rgba(0,212,255,0.04) !important; border-color: rgba(0,212,255,0.15) !important; border-radius: 8px !important; }
+[data-testid="stExpander"] { background: rgba(0,212,255,0.02) !important; border: 1px solid rgba(0,212,255,0.08) !important; border-radius: 10px !important; }
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: #0a0a1a; }
+::-webkit-scrollbar-thumb { background: linear-gradient(180deg, #00d4ff, #7b2fff); border-radius: 3px; }
+hr { border-color: rgba(0,212,255,0.08) !important; }
+.stSuccess, .stInfo, .stWarning, .stError { border-radius: 8px !important; }
+</style>""", unsafe_allow_html=True)
 
-    # 知识库信息
-    st.subheader("📚 知识库信息")
-    try:
-        client = PersistentClient(path=CHROMA_DB_PATH)
-        collection = client.get_collection(COLLECTION_NAME)
-        doc_count = collection.count()   # 统计知识块数量
-
-        if doc_count == 0:
-            st.warning(
-                "⚠️ 知识库为空，请上传文档初始化",
-                icon="⚙️"
-            )
-        else:
-            st.metric("知识块数量", f"{doc_count} 条")  # 显示数字卡片
-            all_data = collection.get(include=["metadatas"])
-            sources = set()
-            for meta in all_data["metadatas"]:
-                if "source" in meta:
-                    sources.add(meta["source"])  # 收集所有文档来源
-            st.metric("文档数量", f"{len(sources)} 份")
-            for source in sorted(sources):
-                st.text(f"  📄 {source}")  # 列出每个文件名
-    except Exception as e:
-        st.error(f"⚠️ 知识库未找到")
-        doc_count = 0
-
-    st.divider()
-
-    # 在 sidebar 中添加更严格的状态管理
-    if 'upload_processing' not in st.session_state:
-        st.session_state.upload_processing = False
-    if 'last_uploaded_files' not in st.session_state:
-        st.session_state.last_uploaded_files = []
-    if 'uploader_key' not in st.session_state:
-        st.session_state.uploader_key = 0
-
-    # 文档上传区域
-    st.subheader("📤 文档上传")
-    uploaded_files = st.file_uploader(
-        "上传企业文档 (PDF/Word/TXT)",
-        type=["pdf", "docx", "doc", "txt"],
-        accept_multiple_files=True,
-        key=f"file_uploader_{st.session_state.uploader_key}"
-    )
-
-    # 检测新上传的文件（与上次不同）
-    current_file_names = [f.name for f in uploaded_files] if uploaded_files else []
-    last_file_names = st.session_state.last_uploaded_files
-
-    has_new_files = uploaded_files and not st.session_state.upload_processing and current_file_names != last_file_names
-
-    if has_new_files:
-        st.session_state.upload_processing = True
-        st.session_state.last_uploaded_files = current_file_names
-
-        with st.spinner("📄 正在处理文档..."):
-            import tempfile
-            import os
-            import shutil
-
-            temp_dir = tempfile.mkdtemp()
-            uploaded_file_paths = []
-
-            try:
-                for uploaded_file in uploaded_files:
-                    file_path = os.path.join(temp_dir, uploaded_file.name)
-                    with open(file_path, "wb") as f:
-                        f.write(uploaded_file.getvalue())
-                    uploaded_file_paths.append(file_path)
-
-                from app.ingest import process_documents
-
-                result = process_documents(uploaded_file_paths)
-
-                if result == "no_new_chunks":
-                    st.info("ℹ️ 文档已存在，无需重复添加")
-                elif result == "new_chunks_added":
-                    st.success(f"✅ 成功处理 {len(uploaded_files)} 个文档！")
-                else:
-                    st.success(f"✅ 处理完成！")
-
-            except Exception as e:
-                st.error(f"❌ 处理失败: {str(e)}")
-            finally:
-                shutil.rmtree(temp_dir)
-                st.session_state.upload_processing = False
-                st.session_state.uploader_key += 1
-                st.rerun()
-
-    st.divider()
-
-    # 清空对话记录
-    if st.button("🗑️ 清空对话记录", use_container_width=True):
-        st.session_state.messages = []  # 清空会话状态
-        st.rerun()  # 刷新页面
-
-    st.divider()
-
-    # 检索参数调节
-    st.subheader("🔧 检索参数")
-    top_k = st.slider("召回知识块数 (Top-K)", min_value=1, max_value=10, value=3, step=1)
-
-    st.divider()
-    st.caption("Enterprise-RAG-System V2.0")
-    st.caption("Powered by Ollama + ChromaDB")
-
-# ==========================================
-# 主界面 - 聊天区域
-# ==========================================
-st.title("🤖 星际科技 · 企业知识库问答")
-st.caption("基于本地大模型的企业级私有知识库，支持 PDF / Word / TXT 多格式文档")
-
-# 初始化对话历史
+# ---- Session State ----
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = settings.DEEPSEEK_MODEL_NAME
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
 
-# 显示历史对话
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):   # role = "user" 或 "assistant"
-        st.markdown(message["content"])  # 显示消息内容
-        # 如果有来源信息，显示参考来源
-        if "sources" in message and message["sources"]:
-            with st.expander("📎 查看参考来源"):   # 可折叠区域
-                for src in message["sources"]:
-                    st.markdown(f"- 📄 {src}")
 
-# 用户输入
-if prompt := st.chat_input("请输入您的问题..."):
-    # 显示用户消息
+def get_kb_info():
+    """Get knowledge base stats."""
+    try:
+        client = chromadb.PersistentClient(path=settings.VECTOR_DB_PATH)
+        collection = client.get_or_create_collection(settings.COLLECTION_NAME)
+        total_chunks = collection.count()
+        results = collection.get(include=["metadatas"])
+        file_map = {}
+        if results and results["metadatas"]:
+            for meta in results["metadatas"]:
+                src = meta.get("source", "unknown")
+                fname = os.path.basename(src) if src != "unknown" else src
+                file_map[fname] = file_map.get(fname, 0) + 1
+        files = [{"name": k, "chunks": v} for k, v in sorted(file_map.items())]
+        return total_chunks, files
+    except Exception as e:
+        logger.error(f"KB info error: {e}")
+        return 0, []
+
+
+# ============================================
+# SIDEBAR
+# ============================================
+with st.sidebar:
+    st.markdown("""
+    <div style="text-align:center; padding:10px 0 20px 0;">
+        <div style="font-size:2.2rem;">&#128302;</div>
+        <div style="font-size:1rem; font-weight:700; color:#00d4ff; letter-spacing:2px;">STELLAR RAG</div>
+        <div style="font-size:0.65rem; color:#4a5568; margin-top:4px;">ENTERPRISE KNOWLEDGE ENGINE</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.divider()
+
+    # ---- Model Router ----
+    st.markdown("**&#127760; MODEL ROUTER**")
+    model_options = settings.get_model_options()
+    model_labels = [label for label, _ in model_options]
+    model_map = {label: name for label, name in model_options}
+    default_idx = 0
+    for i, (label, name) in enumerate(model_options):
+        if name == st.session_state.selected_model:
+            default_idx = i
+            break
+
+    selected_label = st.selectbox(
+        "Model",
+        options=model_labels,
+        index=default_idx,
+        label_visibility="collapsed",
+        key="model_selector"
+    )
+    new_model = model_map[selected_label]
+    if new_model != st.session_state.selected_model:
+        st.session_state.selected_model = new_model
+        st.rerun()
+
+    st.divider()
+
+    # ---- Knowledge Base ----
+    st.markdown("**&#128218; KNOWLEDGE BASE**")
+    total_chunks, file_list = get_kb_info()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Documents", len(file_list))
+    with col2:
+        st.metric("Chunks", total_chunks)
+
+    if file_list:
+        st.markdown("""<div style="color:#607B9E; font-size:0.7rem; letter-spacing:1px; margin:12px 0 6px 0;">
+        INDEXED FILES</div>""", unsafe_allow_html=True)
+        for f in file_list:
+            st.markdown(f"""
+            <div style="background:rgba(0,212,255,0.03); border:1px solid rgba(0,212,255,0.08);
+            border-radius:6px; padding:6px 10px; margin:3px 0;
+            display:flex; justify-content:space-between; align-items:center;">
+                <span style="color:#8892b0; font-size:0.75rem;">&#128196; {f["name"]}</span>
+                <span style="background:rgba(0,212,255,0.12); color:#00d4ff; padding:1px 8px;
+                border-radius:10px; font-size:0.65rem; font-weight:600;">{f["chunks"]} chunks</span>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.caption("No documents indexed yet.")
+
+    st.divider()
+
+    # ---- Upload ----
+    st.markdown("**&#128228; UPLOAD**")
+    uploaded_files = st.file_uploader(
+        "drop",
+        type=["pdf", "docx", "doc", "txt"],
+        accept_multiple_files=True,
+        key=f"uploader_{st.session_state.uploader_key}",
+        label_visibility="collapsed"
+    )
+
+    if uploaded_files:
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            st.caption(f"{len(uploaded_files)} file(s) selected")
+        with col_b:
+            if st.button("&#128640;", help="Process files", use_container_width=True, key="process_btn"):
+                with st.spinner("Processing..."):
+                    temp_dir = tempfile.mkdtemp()
+                    file_paths = []
+                    try:
+                        for uf in uploaded_files:
+                            fp = os.path.join(temp_dir, uf.name)
+                            with open(fp, "wb") as f:
+                                f.write(uf.getvalue())
+                            file_paths.append(fp)
+                        result = ingest_documents(file_paths)
+                        if result == "new_chunks_added":
+                            st.toast(f"Indexed {len(uploaded_files)} document(s)", icon="✅")
+                        elif result == "no_new_chunks":
+                            st.toast("Documents already exist", icon="ℹ️")
+                        else:
+                            st.toast("No new content added", icon="⚠️")
+                        st.session_state.uploader_key += 1
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Upload failed: {str(e)}")
+                        logger.error(f"Upload error: {e}")
+                    finally:
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    st.divider()
+
+    # ---- Search Config ----
+    st.markdown("**&#128269; RETRIEVAL**")
+    top_k = st.slider("Top-K", 1, 10, settings.DEFAULT_TOP_K, 1, label_visibility="collapsed")
+    st.caption(f"Retrieving top {top_k} chunks")
+
+    st.divider()
+
+    # ---- Actions ----
+    if st.button("&#128465;&#65039; Clear Chat", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+    st.markdown("""
+    <div style="text-align:center; color:#3a4560; font-size:0.6rem; letter-spacing:1px; padding-top:20px;">
+        STELLAR RAG &middot; V2.1 &middot; SECURE
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ============================================
+# MAIN CHAT AREA
+# ============================================
+st.markdown("""
+<div style="padding:0 0 8px 0;">
+    <div style="display:flex; align-items:center; gap:12px;">
+        <div style="font-size:2.2rem;">&#128302;</div>
+        <div>
+            <div style="font-size:1.6rem; font-weight:800; background:linear-gradient(90deg, #00d4ff, #7b2fff);
+            -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;">
+                StarTech Enterprise RAG
+            </div>
+            <div style="color:#4a5568; font-size:0.75rem; letter-spacing:0.5px;">
+                Private Knowledge Base &middot; Multi-Model &middot; Real-time Retrieval
+            </div>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+st.divider()
+
+st.markdown(f"""
+<span style="background:rgba(0,212,255,0.08); color:#00d4ff; padding:3px 14px;
+border-radius:20px; font-size:0.7rem; font-weight:600; letter-spacing:1px;
+border:1px solid rgba(0,212,255,0.15);">
+ACTIVE: {st.session_state.selected_model}
+</span>
+""", unsafe_allow_html=True)
+
+# ---- Chat History ----
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg.get("sources"):
+            with st.expander("&#128206; View Sources"):
+                for i, src in enumerate(msg["sources"], 1):
+                    st.caption(f"Source {i}")
+                    st.text(src[:300] + ("..." if len(src) > 300 else ""))
+
+# ---- Chat Input ----
+if prompt := st.chat_input("Ask anything about your enterprise knowledge base..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
-    # 保存到历史记录
-    st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # AI 回答
     with st.chat_message("assistant"):
-        with st.spinner("🤔 正在检索知识库并生成回答..."):
-            # 1. 检索相关上下文
-            context_results = retrieve_context(prompt, top_k=top_k)
+        placeholder = st.empty()
+        placeholder.markdown("""
+        <div style="display:flex; align-items:center; gap:10px; color:#607B9E;">
+            <div style="width:8px; height:8px; background:#00d4ff; border-radius:50%;
+            animation:pulse 1.2s infinite;"></div>
+            <span style="font-size:0.85rem;">Retrieving knowledge &amp; generating response...</span>
+        </div>
+        <style>@keyframes pulse { 0%,100%{opacity:0.3} 50%{opacity:1} }</style>
+        """, unsafe_allow_html=True)
 
-            if not context_results:
-                answer = "根据现有知识库无法回答该问题"
-                sources = []
-            else:
-                # 2. 收集来源信息
-                sources = []
-                for doc, score in context_results:
-                    source_name = doc.metadata.get("source", "未知来源")
-                    page_num = doc.metadata.get("page", None)
-                    if page_num is not None:
-                        source_label = f"{source_name} (第{page_num}页)"
-                    else:
-                        source_label = source_name
-                    if source_label not in sources:
-                        sources.append(f"{source_label} (相关度: {score:.4f})")
-
-                # 3. 拼接上下文
-                context_text = "\n\n".join([doc.page_content for doc, score in context_results])
-                print(f"📝 拼接后的上下文长度: {len(context_text)} 字符")
-
-                # 4. 生成回答
-                answer = generate_answer(prompt, context_text)
-
-            st.markdown(answer)
-
-            # 5. 显示参考来源
+        try:
+            rag = get_rag(model_name=st.session_state.selected_model)
+            result = rag.ask(prompt, top_k=top_k)
+            answer = result["answer"]
+            sources = [s[:200] + "..." if len(s) > 200 else s for s in result["sources"]]
+            placeholder.markdown(answer)
             if sources:
-                with st.expander("📎 查看参考来源"):
-                    for src in sources:
-                        st.markdown(f"- 📄 {src}")
+                with st.expander("&#128206; View Sources"):
+                    for i, src in enumerate(sources, 1):
+                        st.caption(f"Source {i}")
+                        st.text(src)
+        except Exception as e:
+            answer = f"Error: {str(e)}"
+            placeholder.error(answer)
+            sources = []
+            logger.error(f"Chat error: {e}")
 
-    # 保存到对话历史
     st.session_state.messages.append({
         "role": "assistant",
         "content": answer,
